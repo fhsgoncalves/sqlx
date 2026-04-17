@@ -62,6 +62,11 @@ pub enum Command {
         #[clap(long)]
         workspace: bool,
 
+        /// Assume the database schema is unchanged and only force recompilation for packages whose
+        /// SQLx query texts changed.
+        #[clap(long)]
+        assume_schema_unchanged: bool,
+
         /// Arguments to be passed to `cargo rustc ...`.
         #[clap(last = true)]
         args: Vec<String>,

@@ -1,21 +1,27 @@
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::metadata::{manifest_dir, Metadata};
+use crate::metadata::{manifest_dir, Metadata, Package};
 use crate::opt::ConnectOpts;
 use crate::Config;
 use anyhow::{bail, Context};
 use console::style;
+use proc_macro2::TokenStream;
+use serde::{Deserialize, Serialize};
 use sqlx::Connection;
+use syn::parse::{Parse, ParseStream};
+use syn::visit::Visit;
+use syn::{Expr, ExprBinary, ExprGroup, ExprLit, ExprParen, Lit, LitStr, Macro, Token, Type};
 
 pub struct PrepareCtx<'a> {
     pub config: &'a Config,
     pub workspace: bool,
     pub all: bool,
+    pub assume_schema_unchanged: bool,
     pub cargo: OsString,
     pub cargo_args: Vec<String>,
     pub metadata: Metadata,
@@ -31,6 +37,12 @@ impl PrepareCtx<'_> {
             Ok(manifest_dir(&self.cargo)?.join(".sqlx"))
         }
     }
+
+    fn query_manifest_path(&self) -> PathBuf {
+        self.metadata
+            .target_directory()
+            .join("sqlx-prepare-manifest.json")
+    }
 }
 
 pub async fn run(
@@ -38,6 +50,7 @@ pub async fn run(
     check: bool,
     all: bool,
     workspace: bool,
+    assume_schema_unchanged: bool,
     connect_opts: ConnectOpts,
     cargo_args: Vec<String>,
 ) -> anyhow::Result<()> {
@@ -55,6 +68,7 @@ hint: This command only works in the manifest directory of a Cargo package or wo
         config,
         workspace,
         all,
+        assume_schema_unchanged,
         cargo,
         cargo_args,
         metadata,
@@ -77,6 +91,7 @@ async fn prepare(ctx: &PrepareCtx<'_>) -> anyhow::Result<()> {
     let cache_dir = ctx.metadata.target_directory().join("sqlx-prepare");
     run_prepare_step(ctx, &cache_dir)?;
     sync_query_data(&cache_dir, &prepare_dir)?;
+    save_query_manifest(ctx)?;
 
     // Warn if no queries were generated. Glob since the directory may contain unrelated files.
     if glob_query_files(prepare_dir)?.is_empty() {
@@ -174,7 +189,7 @@ fn run_prepare_step(ctx: &PrepareCtx, cache_dir: &Path) -> anyhow::Result<()> {
 
     // Try only triggering a recompile on crates that use `sqlx-macros` falling back to a full
     // clean on error
-    setup_minimal_project_recompile(&ctx.cargo, &ctx.metadata, ctx.all, ctx.workspace)?;
+    setup_minimal_project_recompile(ctx)?;
 
     // Compile the queries.
     let check_status = {
@@ -266,6 +281,16 @@ struct ProjectRecompileAction {
     touch_paths: Vec<PathBuf>,
 }
 
+#[derive(Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+struct QueryManifest {
+    packages: BTreeMap<String, PackageQueries>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+struct PackageQueries {
+    queries: Vec<String>,
+}
+
 /// Sets up recompiling only crates that depend on `sqlx-macros`
 ///
 /// This gets a listing of all crates that depend on `sqlx-macros` (direct and transitive). The
@@ -274,31 +299,38 @@ struct ProjectRecompileAction {
 /// recompile of crates that may be using compile-time macros without forcing a full recompile.
 ///
 /// If `workspace` is false, only the current package will have its files' mtimes updated.
-fn setup_minimal_project_recompile(
-    cargo: impl AsRef<OsStr>,
-    metadata: &Metadata,
-    all: bool,
-    workspace: bool,
-) -> anyhow::Result<()> {
-    let recompile_action: ProjectRecompileAction = if workspace {
-        minimal_project_recompile_action(metadata, all)
-    } else {
-        // Only touch the current crate.
-        ProjectRecompileAction {
-            clean_packages: Vec::new(),
-            touch_paths: metadata.current_package()
-                .context("failed to get package in current working directory, pass `--workspace` if running from a workspace root")?
-                .src_paths()
-                .to_vec(),
+fn setup_minimal_project_recompile(ctx: &PrepareCtx<'_>) -> anyhow::Result<()> {
+    let changed_query_packages = if ctx.assume_schema_unchanged {
+        match changed_query_package_dirs(ctx) {
+            Ok(package_dirs) => Some(package_dirs),
+            Err(err) => {
+                println!(
+                    "{} failed to detect changed query texts, falling back to full prepare behavior ({err})",
+                    style("warning:").yellow()
+                );
+                None
+            }
         }
+    } else {
+        None
     };
 
-    if let Err(err) = minimal_project_clean(&cargo, recompile_action) {
+    let recompile_action: ProjectRecompileAction = if ctx.workspace {
+        minimal_project_recompile_action(&ctx.metadata, ctx.all, changed_query_packages.as_ref())
+    } else {
+        current_package_recompile_action(
+            &ctx.metadata,
+            changed_query_packages.as_ref(),
+            ctx.assume_schema_unchanged,
+        )?
+    };
+
+    if let Err(err) = minimal_project_clean(&ctx.cargo, recompile_action) {
         println!(
             "Failed minimal recompile setup. Cleaning entire project. Err: {}",
             err
         );
-        let clean_status = Command::new(&cargo).arg("clean").status()?;
+        let clean_status = Command::new(&ctx.cargo).arg("clean").status()?;
         if !clean_status.success() {
             bail!("`cargo clean` failed with status: {}", clean_status);
         }
@@ -337,7 +369,33 @@ fn minimal_project_clean(
     Ok(())
 }
 
-fn minimal_project_recompile_action(metadata: &Metadata, all: bool) -> ProjectRecompileAction {
+fn current_package_recompile_action(
+    metadata: &Metadata,
+    changed_query_packages: Option<&BTreeSet<PathBuf>>,
+    assume_schema_unchanged: bool,
+) -> anyhow::Result<ProjectRecompileAction> {
+    let package = metadata.current_package()
+        .context("failed to get package in current working directory, pass `--workspace` if running from a workspace root")?;
+
+    let should_touch = changed_query_packages
+        .map(|packages| packages.contains(package.manifest_dir()))
+        .unwrap_or(!assume_schema_unchanged);
+
+    Ok(ProjectRecompileAction {
+        clean_packages: Vec::new(),
+        touch_paths: if should_touch {
+            package.src_paths().to_vec()
+        } else {
+            Vec::new()
+        },
+    })
+}
+
+fn minimal_project_recompile_action(
+    metadata: &Metadata,
+    all: bool,
+    changed_query_packages: Option<&BTreeSet<PathBuf>>,
+) -> ProjectRecompileAction {
     // Get all the packages that depend on `sqlx-macros`
     let mut sqlx_macros_dependents = BTreeSet::new();
     let sqlx_macros_ids: BTreeSet<_> = metadata
@@ -366,15 +424,22 @@ fn minimal_project_recompile_action(metadata: &Metadata, all: bool) -> ProjectRe
     let files_to_touch: Vec<_> = in_workspace_dependents
         .iter()
         .filter_map(|id| {
-            metadata
-                .package(id)
-                .map(|package| package.src_paths().to_owned())
+            metadata.package(id).and_then(|package| {
+                if changed_query_packages
+                    .map(|packages| packages.contains(package.manifest_dir()))
+                    .unwrap_or(true)
+                {
+                    Some(package.src_paths().to_owned())
+                } else {
+                    None
+                }
+            })
         })
         .flatten()
         .collect();
 
     // Out-of-workspace get `cargo clean -p <PKGID>`ed, only if --all is set.
-    let packages_to_clean: Vec<_> = if all {
+    let packages_to_clean: Vec<_> = if all && changed_query_packages.is_none() {
         out_of_workspace_dependents
             .iter()
             .filter_map(|id| {
@@ -392,6 +457,304 @@ fn minimal_project_recompile_action(metadata: &Metadata, all: bool) -> ProjectRe
     ProjectRecompileAction {
         clean_packages: packages_to_clean,
         touch_paths: files_to_touch,
+    }
+}
+
+fn changed_query_package_dirs(ctx: &PrepareCtx<'_>) -> anyhow::Result<BTreeSet<PathBuf>> {
+    let current_manifest = build_query_manifest(ctx)?;
+    let previous_manifest = load_query_manifest(&ctx.query_manifest_path())?;
+
+    let mut changed_package_dirs = BTreeSet::new();
+
+    for (package_dir, package_queries) in &current_manifest.packages {
+        if previous_manifest.packages.get(package_dir) != Some(package_queries) {
+            changed_package_dirs.insert(PathBuf::from(package_dir));
+        }
+    }
+
+    for package_dir in previous_manifest.packages.keys() {
+        if !current_manifest.packages.contains_key(package_dir) {
+            changed_package_dirs.insert(PathBuf::from(package_dir));
+        }
+    }
+
+    Ok(changed_package_dirs)
+}
+
+fn save_query_manifest(ctx: &PrepareCtx<'_>) -> anyhow::Result<()> {
+    let manifest = build_query_manifest(ctx)?;
+    let manifest_path = ctx.query_manifest_path();
+    let bytes = serde_json::to_vec_pretty(&manifest)?;
+
+    fs::write(&manifest_path, bytes).with_context(|| {
+        format!(
+            "failed to write query manifest: {}",
+            manifest_path.display()
+        )
+    })?;
+
+    Ok(())
+}
+
+fn load_query_manifest(path: &Path) -> anyhow::Result<QueryManifest> {
+    match fs::read(path) {
+        Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(QueryManifest::default()),
+        Err(err) => Err(err)
+            .with_context(|| format!("failed to read query manifest: {}", path.display())),
+    }
+}
+
+fn build_query_manifest(ctx: &PrepareCtx<'_>) -> anyhow::Result<QueryManifest> {
+    let mut packages = BTreeMap::new();
+
+    if ctx.workspace {
+        for package in sqlx_macro_workspace_packages(&ctx.metadata) {
+            packages.insert(package_key(package), scan_package_queries(package)?);
+        }
+    } else {
+        let package = ctx.metadata.current_package()
+            .context("failed to get package in current working directory, pass `--workspace` if running from a workspace root")?;
+        packages.insert(package_key(package), scan_package_queries(package)?);
+    }
+
+    Ok(QueryManifest { packages })
+}
+
+fn package_key(package: &Package) -> String {
+    package.manifest_dir().to_string_lossy().into_owned()
+}
+
+fn sqlx_macro_workspace_packages(metadata: &Metadata) -> Vec<&Package> {
+    let mut sqlx_macros_dependents = BTreeSet::new();
+    let sqlx_macros_ids: BTreeSet<_> = metadata
+        .entries()
+        .filter(|(_, package)| package.name() == "sqlx-macros")
+        .map(|(id, _)| id)
+        .collect();
+
+    for sqlx_macros_id in sqlx_macros_ids {
+        sqlx_macros_dependents.extend(metadata.all_dependents_of(sqlx_macros_id));
+    }
+
+    sqlx_macros_dependents
+        .into_iter()
+        .filter(|id| metadata.workspace_members().contains(id))
+        .filter_map(|id| metadata.package(id))
+        .collect()
+}
+
+fn scan_package_queries(package: &Package) -> anyhow::Result<PackageQueries> {
+    let mut queries = Vec::new();
+
+    for rust_file in rust_files_in(package.manifest_dir())? {
+        let source = fs::read_to_string(&rust_file)
+            .with_context(|| format!("failed to read Rust source file: {}", rust_file.display()))?;
+        let syntax = syn::parse_file(&source)
+            .with_context(|| format!("failed to parse Rust source file: {}", rust_file.display()))?;
+
+        let mut visitor = SqlxQueryVisitor::new(package.manifest_dir());
+        visitor.visit_file(&syntax);
+        queries.extend(visitor.finish()?);
+    }
+
+    queries.sort();
+    queries.dedup();
+
+    Ok(PackageQueries { queries })
+}
+
+fn rust_files_in(dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    let mut dirs = vec![dir.to_path_buf()];
+
+    while let Some(path) = dirs.pop() {
+        for entry in fs::read_dir(&path)
+            .with_context(|| format!("failed to read directory: {}", path.display()))?
+        {
+            let entry = entry?;
+            let entry_path = entry.path();
+            let file_type = entry.file_type()?;
+
+            if file_type.is_dir() {
+                if entry.file_name() == OsStr::new("target") {
+                    continue;
+                }
+
+                dirs.push(entry_path);
+            } else if file_type.is_file()
+                && entry_path.extension().is_some_and(|ext| ext == OsStr::new("rs"))
+            {
+                files.push(entry_path);
+            }
+        }
+    }
+
+    files.sort();
+    Ok(files)
+}
+
+struct SqlxQueryVisitor<'a> {
+    package_dir: &'a Path,
+    queries: Vec<String>,
+    error: Option<anyhow::Error>,
+}
+
+impl<'a> SqlxQueryVisitor<'a> {
+    fn new(package_dir: &'a Path) -> Self {
+        Self {
+            package_dir,
+            queries: Vec::new(),
+            error: None,
+        }
+    }
+
+    fn finish(self) -> anyhow::Result<Vec<String>> {
+        if let Some(err) = self.error {
+            Err(err)
+        } else {
+            Ok(self.queries)
+        }
+    }
+}
+
+impl Visit<'_> for SqlxQueryVisitor<'_> {
+    fn visit_macro(&mut self, mac: &Macro) {
+        if self.error.is_none() {
+            match extract_query_text(mac, self.package_dir) {
+                Ok(Some(query)) => self.queries.push(query),
+                Ok(None) => {}
+                Err(err) => self.error = Some(err),
+            }
+        }
+
+        syn::visit::visit_macro(self, mac);
+    }
+}
+
+fn extract_query_text(mac: &Macro, package_dir: &Path) -> anyhow::Result<Option<String>> {
+    let Some(ident) = mac.path.segments.last().map(|segment| segment.ident.to_string()) else {
+        return Ok(None);
+    };
+
+    match ident.as_str() {
+        "query" | "query_unchecked" | "query_scalar" | "query_scalar_unchecked" => {
+            let args: QueryMacroArgs = syn::parse2(mac.tokens.clone()).with_context(|| {
+                format!("failed to parse macro arguments for `{ident}!`")
+            })?;
+            Ok(eval_string_expr(&args.query))
+        }
+        "query_as" | "query_as_unchecked" => {
+            let args: QueryAsMacroArgs = syn::parse2(mac.tokens.clone()).with_context(|| {
+                format!("failed to parse macro arguments for `{ident}!`")
+            })?;
+            Ok(eval_string_expr(&args.query))
+        }
+        "query_file"
+        | "query_file_unchecked"
+        | "query_file_scalar"
+        | "query_file_scalar_unchecked" => {
+            let args: QueryFileMacroArgs = syn::parse2(mac.tokens.clone()).with_context(|| {
+                format!("failed to parse macro arguments for `{ident}!`")
+            })?;
+            Ok(Some(read_query_file(package_dir, &args.path)?))
+        }
+        "query_file_as" | "query_file_as_unchecked" => {
+            let args: QueryFileAsMacroArgs = syn::parse2(mac.tokens.clone()).with_context(|| {
+                format!("failed to parse macro arguments for `{ident}!`")
+            })?;
+            Ok(Some(read_query_file(package_dir, &args.path)?))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn read_query_file(package_dir: &Path, path: &LitStr) -> anyhow::Result<String> {
+    let query_path = package_dir.join(path.value());
+    fs::read_to_string(&query_path)
+        .with_context(|| format!("failed to read SQL query file: {}", query_path.display()))
+}
+
+fn eval_string_expr(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Lit(ExprLit {
+            lit: Lit::Str(lit_str),
+            ..
+        }) => Some(lit_str.value()),
+        Expr::Binary(ExprBinary {
+            left,
+            op: syn::BinOp::Add(_),
+            right,
+            ..
+        }) => Some(format!("{}{}", eval_string_expr(left)?, eval_string_expr(right)?)),
+        Expr::Group(ExprGroup { expr, .. }) | Expr::Paren(ExprParen { expr, .. }) => {
+            eval_string_expr(expr)
+        }
+        _ => None,
+    }
+}
+
+struct QueryMacroArgs {
+    query: Expr,
+}
+
+impl Parse for QueryMacroArgs {
+    fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
+        let query = input.parse()?;
+        let _ = input.parse::<Option<Token![,]>>()?;
+        let _rest: TokenStream = input.parse()?;
+        Ok(Self { query })
+    }
+}
+
+struct QueryAsMacroArgs {
+    _record: Type,
+    query: Expr,
+}
+
+impl Parse for QueryAsMacroArgs {
+    fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
+        let record = input.parse()?;
+        let _comma = input.parse::<Token![,]>()?;
+        let query = input.parse()?;
+        let _ = input.parse::<Option<Token![,]>>()?;
+        let _rest: TokenStream = input.parse()?;
+        Ok(Self {
+            _record: record,
+            query,
+        })
+    }
+}
+
+struct QueryFileMacroArgs {
+    path: LitStr,
+}
+
+impl Parse for QueryFileMacroArgs {
+    fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
+        let path = input.parse()?;
+        let _ = input.parse::<Option<Token![,]>>()?;
+        let _rest: TokenStream = input.parse()?;
+        Ok(Self { path })
+    }
+}
+
+struct QueryFileAsMacroArgs {
+    _record: Type,
+    path: LitStr,
+}
+
+impl Parse for QueryFileAsMacroArgs {
+    fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
+        let record = input.parse()?;
+        let _comma = input.parse::<Token![,]>()?;
+        let path = input.parse()?;
+        let _ = input.parse::<Option<Token![,]>>()?;
+        let _rest: TokenStream = input.parse()?;
+        Ok(Self {
+            _record: record,
+            path,
+        })
     }
 }
 
@@ -435,7 +798,7 @@ mod tests {
         let sample_metadata = std::fs::read_to_string(sample_metadata_path)?;
         let metadata: Metadata = sample_metadata.parse()?;
 
-        let action = minimal_project_recompile_action(&metadata, false);
+        let action = minimal_project_recompile_action(&metadata, false, None);
         assert_eq!(
             action,
             ProjectRecompileAction {
@@ -447,6 +810,27 @@ mod tests {
             }
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn eval_string_expr_handles_literal_concat() -> anyhow::Result<()> {
+        let expr: Expr = syn::parse_str("\"SELECT \" + \"1\"")?;
+        assert_eq!(eval_string_expr(&expr), Some("SELECT 1".to_string()));
+        Ok(())
+    }
+
+    #[test]
+    fn extract_query_text_reads_query_file_macro() -> anyhow::Result<()> {
+        let tempdir = tempfile::tempdir()?;
+        let sql_path = tempdir.path().join("query.sql");
+        fs::write(&sql_path, "select 1")?;
+
+        let mac: Macro = syn::parse_str("query_file!(\"query.sql\")")?;
+        assert_eq!(
+            extract_query_text(&mac, tempdir.path())?,
+            Some("select 1".to_string())
+        );
         Ok(())
     }
 }
