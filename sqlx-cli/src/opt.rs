@@ -62,6 +62,15 @@ pub enum Command {
         #[clap(long)]
         workspace: bool,
 
+        /// Detect packages whose SQLx query texts changed and only force recompilation for those
+        /// packages.
+        #[clap(long)]
+        detect_query_changes: bool,
+
+        /// Print detailed information about prepare path selection and affected packages.
+        #[clap(long)]
+        verbose: bool,
+
         /// Arguments to be passed to `cargo rustc ...`.
         #[clap(last = true)]
         args: Vec<String>,

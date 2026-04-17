@@ -19,6 +19,7 @@ use cargo_metadata::{
 #[derive(Debug)]
 pub struct Package {
     name: MetadataPackageName,
+    manifest_dir: PathBuf,
     src_paths: Vec<PathBuf>,
 }
 
@@ -30,18 +31,28 @@ impl Package {
     pub fn src_paths(&self) -> &[PathBuf] {
         &self.src_paths
     }
+
+    pub fn manifest_dir(&self) -> &Path {
+        &self.manifest_dir
+    }
 }
 
 impl From<&MetadataPackage> for Package {
     fn from(package: &MetadataPackage) -> Self {
         let name = package.name.clone();
+        let mut manifest_dir = package.manifest_path.clone().into_std_path_buf();
+        manifest_dir.pop();
         let src_paths = package
             .targets
             .iter()
             .map(|target| target.src_path.clone().into_std_path_buf())
             .collect();
 
-        Self { name, src_paths }
+        Self {
+            name,
+            manifest_dir,
+            src_paths,
+        }
     }
 }
 
