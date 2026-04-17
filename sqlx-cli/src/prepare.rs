@@ -21,8 +21,8 @@ pub struct PrepareCtx<'a> {
     pub config: &'a Config,
     pub workspace: bool,
     pub all: bool,
-    pub assume_schema_unchanged: bool,
-    pub experimental_schema_change_detection: bool,
+    pub detect_query_changes: bool,
+    pub detect_schema_changes: bool,
     pub verbose: bool,
     pub cargo: OsString,
     pub cargo_args: Vec<String>,
@@ -52,14 +52,12 @@ pub async fn run(
     check: bool,
     all: bool,
     workspace: bool,
-    assume_schema_unchanged: bool,
-    experimental_schema_change_detection: bool,
+    detect_query_changes: bool,
+    detect_schema_changes: bool,
     verbose: bool,
     connect_opts: ConnectOpts,
     cargo_args: Vec<String>,
 ) -> anyhow::Result<()> {
-    let assume_schema_unchanged = assume_schema_unchanged || experimental_schema_change_detection;
-
     let cargo = env::var_os("CARGO")
         .context("failed to get value of `CARGO`; `prepare` subcommand may only be invoked as `cargo sqlx prepare`")?;
 
@@ -74,8 +72,8 @@ hint: This command only works in the manifest directory of a Cargo package or wo
         config,
         workspace,
         all,
-        assume_schema_unchanged,
-        experimental_schema_change_detection,
+        detect_query_changes,
+        detect_schema_changes,
         verbose,
         cargo,
         cargo_args,
@@ -97,7 +95,7 @@ async fn prepare(ctx: &PrepareCtx<'_>) -> anyhow::Result<()> {
 
     let previous_manifest = load_query_manifest(&ctx.query_manifest_path())?;
     let current_manifest = build_query_manifest(ctx).await?;
-    let selection = if ctx.assume_schema_unchanged || ctx.experimental_schema_change_detection {
+    let selection = if ctx.detect_query_changes || ctx.detect_schema_changes {
         match select_changed_packages(ctx, &current_manifest, &previous_manifest) {
             Ok(selection) => Some(selection),
             Err(err) => {
@@ -550,7 +548,7 @@ fn select_changed_packages(
     let mut schema_changed_packages = BTreeSet::new();
     let mut changed_schema_objects = BTreeSet::new();
 
-    if ctx.experimental_schema_change_detection {
+    if ctx.detect_schema_changes {
         let schema_changes = schema_affected_package_dirs(current_manifest, previous_manifest)?;
         changed_schema_objects = schema_changes.changed_objects;
         schema_changed_packages = schema_changes.packages;
@@ -627,11 +625,8 @@ fn schema_affected_package_dirs(
 fn print_verbose_selection(ctx: &PrepareCtx<'_>, selection: Option<&PackageSelection>) {
     println!("prepare verbose:");
     println!("  workspace: {}", ctx.workspace);
-    println!("  assume-schema-unchanged: {}", ctx.assume_schema_unchanged);
-    println!(
-        "  experimental-schema-change-detection: {}",
-        ctx.experimental_schema_change_detection
-    );
+    println!("  detect-query-changes: {}", ctx.detect_query_changes);
+    println!("  detect-schema-changes: {}", ctx.detect_schema_changes);
 
     match selection {
         None => {
@@ -651,7 +646,7 @@ fn print_verbose_selection(ctx: &PrepareCtx<'_>, selection: Option<&PackageSelec
                 }
             }
 
-            if ctx.experimental_schema_change_detection {
+            if ctx.detect_schema_changes {
                 println!(
                     "  schema objects changed: {}",
                     selection.changed_schema_objects.len()
@@ -718,7 +713,7 @@ async fn build_query_manifest(ctx: &PrepareCtx<'_>) -> anyhow::Result<QueryManif
 
     Ok(QueryManifest {
         packages,
-        postgres_schema: if ctx.experimental_schema_change_detection {
+        postgres_schema: if ctx.detect_schema_changes {
             fetch_postgres_schema_snapshot(ctx).await?
         } else {
             None

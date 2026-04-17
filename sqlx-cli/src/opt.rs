@@ -62,16 +62,15 @@ pub enum Command {
         #[clap(long)]
         workspace: bool,
 
-        /// Assume the database schema is unchanged and only force recompilation for packages whose
-        /// SQLx query texts changed.
+        /// Detect packages whose SQLx query texts changed and only force recompilation for those
+        /// packages.
         #[clap(long)]
-        assume_schema_unchanged: bool,
+        detect_query_changes: bool,
 
-        /// Experimental: implies `--assume-schema-unchanged` and, for Postgres only, also diffs
-        /// the live schema snapshot to recompile packages whose inferred SQL dependencies touch
-        /// changed relations, functions, or types.
+        /// EXPERIMENTAL: for Postgres only, diff the live schema snapshot and recompile packages
+        /// whose inferred SQL dependencies touch changed relations, functions, or types.
         #[clap(long)]
-        experimental_schema_change_detection: bool,
+        detect_schema_changes: bool,
 
         /// Print detailed information about prepare path selection and affected packages.
         #[clap(long)]

@@ -71,7 +71,7 @@ async fn prepare_verbose_reports_selective_path() {
             "prepare",
             "--database-url",
             &database_url,
-            "--experimental-schema-change-detection",
+            "--detect-schema-changes",
             "--verbose",
         ])
         .assert()
@@ -84,7 +84,7 @@ async fn prepare_verbose_reports_selective_path() {
             "prepare",
             "--database-url",
             &database_url,
-            "--experimental-schema-change-detection",
+            "--detect-schema-changes",
             "--verbose",
         ])
         .assert()
@@ -93,7 +93,7 @@ async fn prepare_verbose_reports_selective_path() {
     let stdout = String::from_utf8_lossy(&assert.get_output().stdout);
     assert!(stdout.contains("prepare verbose:"));
     assert!(stdout.contains("path: selective prepare"));
-    assert!(stdout.contains("experimental-schema-change-detection: true"));
+    assert!(stdout.contains("detect-schema-changes: true"));
     assert!(stdout.contains("packages selected: 0"));
     assert!(stdout.contains("no packages selected"));
     assert!(stdout.contains("query data unchanged; skipping recompilation"));
