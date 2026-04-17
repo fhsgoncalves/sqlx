@@ -67,6 +67,16 @@ pub enum Command {
         #[clap(long)]
         assume_schema_unchanged: bool,
 
+        /// Experimental: implies `--assume-schema-unchanged` and, for Postgres only, also diffs
+        /// the live schema snapshot to recompile packages whose inferred SQL dependencies touch
+        /// changed relations, functions, or types.
+        #[clap(long)]
+        experimental_schema_change_detection: bool,
+
+        /// Print detailed information about prepare path selection and affected packages.
+        #[clap(long)]
+        verbose: bool,
+
         /// Arguments to be passed to `cargo rustc ...`.
         #[clap(last = true)]
         args: Vec<String>,

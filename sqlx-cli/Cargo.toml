@@ -42,6 +42,8 @@ openssl = { version = "0.10.46", optional = true }
 cargo_metadata = "0.23.1"
 filetime = "0.2"
 proc-macro2 = "1"
+sha2 = "0.10"
+hex = "0.4"
 syn = { version = "2", features = ["full", "parsing", "visit"] }
 
 backoff = { version = "0.4.0", features = ["futures", "tokio"] }

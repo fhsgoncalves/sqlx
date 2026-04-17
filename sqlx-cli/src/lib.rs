@@ -196,6 +196,8 @@ async fn do_run(opt: Opt) -> anyhow::Result<()> {
             all,
             workspace,
             assume_schema_unchanged,
+            experimental_schema_change_detection,
+            verbose,
             mut connect_opts,
             args,
             config,
@@ -208,6 +210,8 @@ async fn do_run(opt: Opt) -> anyhow::Result<()> {
                 all,
                 workspace,
                 assume_schema_unchanged,
+                experimental_schema_change_detection,
+                verbose,
                 connect_opts,
                 args,
             )
