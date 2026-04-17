@@ -67,6 +67,11 @@ pub enum Command {
         #[clap(long)]
         detect_query_changes: bool,
 
+        /// EXPERIMENTAL: for Postgres only, diff the live schema snapshot and recompile packages
+        /// whose inferred SQL dependencies touch changed relations, functions, or types.
+        #[clap(long)]
+        detect_schema_changes: bool,
+
         /// Print detailed information about prepare path selection and affected packages.
         #[clap(long)]
         verbose: bool,

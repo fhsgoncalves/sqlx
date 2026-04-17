@@ -1,19 +1,19 @@
 use assert_cmd::cargo_bin_cmd;
-use serde::Deserialize;
 use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::{Connection, Executor, SqliteConnection};
-use std::collections::BTreeMap;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+use std::path::Path;
 use std::str::FromStr;
 use tempfile::TempDir;
 
-#[derive(Deserialize)]
+#[derive(serde::Deserialize)]
 struct TestManifest {
     packages: BTreeMap<String, TestPackageQueries>,
 }
 
-#[derive(Deserialize)]
+#[derive(serde::Deserialize)]
 struct TestPackageQueries {
     queries: Vec<String>,
 }
@@ -52,7 +52,9 @@ tokio = {{ version = "1", features = ["macros", "rt-multi-thread"] }}
     fs::create_dir_all(tempdir.path().join("src")).unwrap();
     fs::write(
         tempdir.path().join("src/main.rs"),
-        format!("fn main() {{\n    let _ = sqlx::query!(\"{query}\");\n}}\n"),
+        format!(
+            "fn main() {{\n    let _ = sqlx::query!(\"{query}\");\n}}\n"
+        ),
     )
     .unwrap();
 }
@@ -92,6 +94,50 @@ async fn setup_sqlite_db(database_url: &str) {
 }
 
 #[tokio::test]
+async fn prepare_verbose_reports_selective_path() {
+    let tempdir = TempDir::new().unwrap();
+    write_test_project(&tempdir);
+
+    let db_path = tempdir.path().join("prepare.db");
+    let database_url = format!("sqlite://{}", db_path.display());
+    setup_sqlite_db(&database_url).await;
+
+    let _assert = cargo_bin_cmd!("cargo-sqlx")
+        .current_dir(tempdir.path())
+        .args([
+            "sqlx",
+            "prepare",
+            "--database-url",
+            &database_url,
+            "--detect-schema-changes",
+            "--verbose",
+        ])
+        .assert()
+        .success();
+
+    let assert = cargo_bin_cmd!("cargo-sqlx")
+        .current_dir(tempdir.path())
+        .args([
+            "sqlx",
+            "prepare",
+            "--database-url",
+            &database_url,
+            "--detect-schema-changes",
+            "--verbose",
+        ])
+        .assert()
+        .success();
+
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout);
+    assert!(stdout.contains("prepare verbose:"));
+    assert!(stdout.contains("path: selective prepare"));
+    assert!(stdout.contains("detect-schema-changes: true"));
+    assert!(stdout.contains("packages selected: 0"));
+    assert!(stdout.contains("no packages selected"));
+    assert!(stdout.contains("schema data unchanged; skipping recompilation"));
+}
+
+#[tokio::test]
 async fn detect_query_changes_prunes_stale_query_file() {
     let tempdir = TempDir::new().unwrap();
     write_test_project(&tempdir);
@@ -100,7 +146,7 @@ async fn detect_query_changes_prunes_stale_query_file() {
     let database_url = format!("sqlite://{}", db_path.display());
     setup_sqlite_db(&database_url).await;
 
-    cargo_bin_cmd!("cargo-sqlx")
+    let _assert = cargo_bin_cmd!("cargo-sqlx")
         .current_dir(tempdir.path())
         .args([
             "sqlx",
@@ -134,10 +180,24 @@ async fn detect_query_changes_prunes_stale_query_file() {
     let stdout = String::from_utf8_lossy(&assert.get_output().stdout);
     let new_manifest = read_prepare_manifest(&tempdir);
     assert_ne!(
-        old_manifest.packages.values().next().unwrap().queries,
-        new_manifest.packages.values().next().unwrap().queries,
+        old_manifest
+            .packages
+            .values()
+            .next()
+            .unwrap()
+            .queries,
+        new_manifest
+            .packages
+            .values()
+            .next()
+            .unwrap()
+            .queries,
+        "manifests should differ"
     );
-    assert!(stdout.contains("stale query files pruned: 1"), "stdout was:\n{stdout}");
+    assert!(
+        stdout.contains("stale query files pruned: 1"),
+        "stdout was:\n{stdout}"
+    );
 
     let new_files = sqlx_query_files(&tempdir);
     assert_eq!(new_files.len(), 1);
