@@ -2,9 +2,21 @@ use assert_cmd::cargo_bin_cmd;
 use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::{Connection, Executor, SqliteConnection};
 use std::fs;
+use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::path::Path;
 use std::str::FromStr;
 use tempfile::TempDir;
+
+#[derive(serde::Deserialize)]
+struct TestManifest {
+    packages: BTreeMap<String, TestPackageQueries>,
+}
+
+#[derive(serde::Deserialize)]
+struct TestPackageQueries {
+    queries: Vec<String>,
+}
 
 fn workspace_root() -> String {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -15,6 +27,10 @@ fn workspace_root() -> String {
 }
 
 fn write_test_project(tempdir: &TempDir) {
+    write_query_source(tempdir, "select id from users");
+}
+
+fn write_query_source(tempdir: &TempDir, query: &str) {
     let root = workspace_root();
 
     fs::write(
@@ -36,12 +52,34 @@ tokio = {{ version = "1", features = ["macros", "rt-multi-thread"] }}
     fs::create_dir_all(tempdir.path().join("src")).unwrap();
     fs::write(
         tempdir.path().join("src/main.rs"),
-        r#"fn main() {
-    let _ = sqlx::query!("select id from users");
-}
-"#,
+        format!(
+            "fn main() {{\n    let _ = sqlx::query!(\"{query}\");\n}}\n"
+        ),
     )
     .unwrap();
+}
+
+fn sqlx_query_files(tempdir: &TempDir) -> Vec<PathBuf> {
+    let mut files: Vec<_> = fs::read_dir(tempdir.path().join(".sqlx"))
+        .unwrap()
+        .filter_map(|entry| {
+            let path = entry.ok()?.path();
+            (path.file_name()?
+                .to_string_lossy()
+                .starts_with("query-")
+                && path.extension().is_some_and(|ext| ext == "json"))
+            .then_some(path)
+        })
+        .collect();
+    files.sort();
+    files
+}
+
+fn read_prepare_manifest(tempdir: &TempDir) -> TestManifest {
+    serde_json::from_slice(
+        &fs::read(tempdir.path().join("target/sqlx-prepare-manifest.json")).unwrap(),
+    )
+    .unwrap()
 }
 
 async fn setup_sqlite_db(database_url: &str) {
@@ -64,7 +102,7 @@ async fn prepare_verbose_reports_selective_path() {
     let database_url = format!("sqlite://{}", db_path.display());
     setup_sqlite_db(&database_url).await;
 
-    cargo_bin_cmd!("cargo-sqlx")
+    let _assert = cargo_bin_cmd!("cargo-sqlx")
         .current_dir(tempdir.path())
         .args([
             "sqlx",
@@ -97,4 +135,72 @@ async fn prepare_verbose_reports_selective_path() {
     assert!(stdout.contains("packages selected: 0"));
     assert!(stdout.contains("no packages selected"));
     assert!(stdout.contains("schema data unchanged; skipping recompilation"));
+}
+
+#[tokio::test]
+async fn detect_query_changes_prunes_stale_query_file() {
+    let tempdir = TempDir::new().unwrap();
+    write_test_project(&tempdir);
+
+    let db_path = tempdir.path().join("prepare-prune.db");
+    let database_url = format!("sqlite://{}", db_path.display());
+    setup_sqlite_db(&database_url).await;
+
+    let _assert = cargo_bin_cmd!("cargo-sqlx")
+        .current_dir(tempdir.path())
+        .args([
+            "sqlx",
+            "prepare",
+            "--database-url",
+            &database_url,
+            "--detect-query-changes",
+        ])
+        .assert()
+        .success();
+
+    let old_files = sqlx_query_files(&tempdir);
+    assert_eq!(old_files.len(), 1);
+    let old_manifest = read_prepare_manifest(&tempdir);
+
+    write_query_source(&tempdir, "select id, id as id2 from users");
+
+    let assert = cargo_bin_cmd!("cargo-sqlx")
+        .current_dir(tempdir.path())
+        .args([
+            "sqlx",
+            "prepare",
+            "--database-url",
+            &database_url,
+            "--detect-query-changes",
+            "--verbose",
+        ])
+        .assert()
+        .success();
+
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout);
+    let new_manifest = read_prepare_manifest(&tempdir);
+    assert_ne!(
+        old_manifest
+            .packages
+            .values()
+            .next()
+            .unwrap()
+            .queries,
+        new_manifest
+            .packages
+            .values()
+            .next()
+            .unwrap()
+            .queries,
+        "manifests should differ"
+    );
+    assert!(
+        stdout.contains("stale query files pruned: 1"),
+        "stdout was:\n{stdout}"
+    );
+
+    let new_files = sqlx_query_files(&tempdir);
+    assert_eq!(new_files.len(), 1);
+    assert_ne!(old_files[0], new_files[0]);
+    assert!(!old_files[0].exists());
 }

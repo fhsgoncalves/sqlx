@@ -123,13 +123,14 @@ async fn prepare(ctx: &PrepareCtx<'_>) -> anyhow::Result<()> {
     let prepare_dir = ctx.prepare_dir()?;
     let cache_dir = ctx.metadata.target_directory().join("sqlx-prepare");
     run_prepare_step(ctx, &cache_dir, selection.as_ref().map(|selection| &selection.packages))?;
-    sync_query_data(
+    let pruned_files = sync_query_data(
         &cache_dir,
         &prepare_dir,
         &previous_manifest,
         &current_manifest,
         selection.as_ref().map(|selection| &selection.packages),
     )?;
+    println!("stale query files pruned: {pruned_files}");
     save_query_manifest(ctx, &current_manifest)?;
 
     // Warn if no queries were generated. Glob since the directory may contain unrelated files.
@@ -270,7 +271,7 @@ fn sync_query_data(
     previous_manifest: &QueryManifest,
     current_manifest: &QueryManifest,
     touched_packages: Option<&BTreeSet<PathBuf>>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<usize> {
     fs::create_dir_all(prepare_dir).context(format!(
         "Failed to create query cache directory: {:?}",
         prepare_dir
@@ -296,6 +297,8 @@ fn sync_query_data(
             .cloned()
             .collect()
     };
+
+    let pruned_count = stale_filenames.len();
 
     for stale_filename in stale_filenames {
         let stale_file = prepare_dir.join(stale_filename);
@@ -335,7 +338,7 @@ fn sync_query_data(
         }
     }
 
-    Ok(())
+    Ok(pruned_count)
 }
 
 #[derive(Debug, PartialEq)]
