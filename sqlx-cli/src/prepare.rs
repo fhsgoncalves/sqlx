@@ -12,7 +12,7 @@ use anyhow::{bail, Context};
 use console::style;
 use proc_macro2::TokenStream;
 use serde::{Deserialize, Serialize};
-use sqlx::Connection;
+use sqlx::{Connection, Row};
 use syn::parse::{Parse, ParseStream};
 use syn::visit::Visit;
 use syn::{Expr, ExprBinary, ExprGroup, ExprLit, ExprParen, Lit, LitStr, Macro, Token, Type};
@@ -22,6 +22,7 @@ pub struct PrepareCtx<'a> {
     pub workspace: bool,
     pub all: bool,
     pub detect_query_changes: bool,
+    pub detect_schema_changes: bool,
     pub verbose: bool,
     pub cargo: OsString,
     pub cargo_args: Vec<String>,
@@ -52,6 +53,7 @@ pub async fn run(
     all: bool,
     workspace: bool,
     detect_query_changes: bool,
+    detect_schema_changes: bool,
     verbose: bool,
     connect_opts: ConnectOpts,
     cargo_args: Vec<String>,
@@ -71,6 +73,7 @@ hint: This command only works in the manifest directory of a Cargo package or wo
         workspace,
         all,
         detect_query_changes,
+        detect_schema_changes,
         verbose,
         cargo,
         cargo_args,
@@ -91,9 +94,9 @@ async fn prepare(ctx: &PrepareCtx<'_>) -> anyhow::Result<()> {
     }
 
     let previous_manifest = load_query_manifest(&ctx.query_manifest_path())?;
-    let current_manifest = build_query_manifest(ctx)?;
-    let selection = if ctx.detect_query_changes {
-        match select_changed_packages(&current_manifest, &previous_manifest) {
+    let current_manifest = build_query_manifest(ctx).await?;
+    let selection = if ctx.detect_query_changes || ctx.detect_schema_changes {
+        match select_changed_packages(ctx, &current_manifest, &previous_manifest) {
             Ok(selection) => Some(selection),
             Err(err) => {
                 println!(
@@ -116,7 +119,7 @@ async fn prepare(ctx: &PrepareCtx<'_>) -> anyhow::Result<()> {
         .is_some_and(|selection| selection.packages.is_empty())
     {
         save_query_manifest(ctx, &current_manifest)?;
-        println!("query data unchanged; skipping recompilation");
+        println!("{}; skipping recompilation", unchanged_reason(ctx));
         return Ok(());
     }
 
@@ -352,19 +355,31 @@ struct ProjectRecompileAction {
 }
 
 #[derive(Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
 struct QueryManifest {
     packages: BTreeMap<String, PackageQueries>,
+    postgres_schema: Option<PostgresSchemaSnapshot>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+struct PackageQueries {
+    queries: Vec<String>,
+    dependencies: Vec<String>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+struct PostgresSchemaSnapshot {
+    objects: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Default)]
 struct PackageSelection {
     packages: BTreeSet<PathBuf>,
     query_changed_packages: BTreeSet<PathBuf>,
-}
-
-#[derive(Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
-struct PackageQueries {
-    queries: Vec<String>,
+    schema_changed_packages: BTreeSet<PathBuf>,
+    changed_schema_objects: BTreeSet<String>,
 }
 
 /// Sets up recompiling only crates that depend on `sqlx-macros`
@@ -377,12 +392,12 @@ struct PackageQueries {
 /// If `workspace` is false, only the current package will have its files' mtimes updated.
 fn setup_minimal_project_recompile(
     ctx: &PrepareCtx<'_>,
-    changed_query_packages: Option<&BTreeSet<PathBuf>>,
+    changed_packages: Option<&BTreeSet<PathBuf>>,
 ) -> anyhow::Result<()> {
     let recompile_action: ProjectRecompileAction = if ctx.workspace {
-        minimal_project_recompile_action(&ctx.metadata, ctx.all, changed_query_packages)
+        minimal_project_recompile_action(&ctx.metadata, ctx.all, changed_packages)
     } else {
-        current_package_recompile_action(&ctx.metadata, changed_query_packages)?
+        current_package_recompile_action(&ctx.metadata, changed_packages)?
     };
 
     if let Err(err) = minimal_project_clean(&ctx.cargo, recompile_action) {
@@ -520,26 +535,63 @@ fn minimal_project_recompile_action(
 }
 
 fn select_changed_packages(
+    ctx: &PrepareCtx<'_>,
     current_manifest: &QueryManifest,
     previous_manifest: &QueryManifest,
 ) -> anyhow::Result<PackageSelection> {
     if previous_manifest.packages.is_empty() {
-        let packages: BTreeSet<PathBuf> = current_manifest
-            .packages
-            .keys()
-            .map(PathBuf::from)
-            .collect();
+        let query_changed_packages = if ctx.detect_query_changes {
+            current_manifest
+                .packages
+                .keys()
+                .map(PathBuf::from)
+                .collect()
+        } else {
+            BTreeSet::new()
+        };
+        let schema_changed_packages = if ctx.detect_schema_changes {
+            current_manifest
+                .packages
+                .keys()
+                .map(PathBuf::from)
+                .collect()
+        } else {
+            BTreeSet::new()
+        };
+        let mut packages = query_changed_packages.clone();
+        packages.extend(schema_changed_packages.iter().cloned());
         return Ok(PackageSelection {
-            query_changed_packages: packages.clone(),
+            query_changed_packages,
+            schema_changed_packages,
             packages,
+            ..Default::default()
         });
     }
 
-    let query_changed_packages = query_changed_package_dirs(current_manifest, previous_manifest);
+    let query_changed_packages = if ctx.detect_query_changes {
+        query_changed_package_dirs(current_manifest, previous_manifest)
+    } else {
+        BTreeSet::new()
+    };
+    let mut packages = query_changed_packages.clone();
+    let mut schema_changed_packages = BTreeSet::new();
+    let mut changed_schema_objects = BTreeSet::new();
+
+    if ctx.detect_schema_changes {
+        let schema_changes = schema_affected_package_dirs(current_manifest, previous_manifest)?;
+        changed_schema_objects = schema_changes.changed_objects;
+        schema_changed_packages = schema_changes.packages;
+
+        for package_dir in &schema_changed_packages {
+            packages.insert(package_dir.clone());
+        }
+    }
 
     Ok(PackageSelection {
-        packages: query_changed_packages.clone(),
+        packages,
         query_changed_packages,
+        schema_changed_packages,
+        changed_schema_objects,
     })
 }
 
@@ -569,13 +621,56 @@ fn query_changed_package_dirs(
     changed_package_dirs
 }
 
+#[derive(Debug, Default)]
+struct SchemaAffectedPackages {
+    packages: BTreeSet<PathBuf>,
+    changed_objects: BTreeSet<String>,
+}
+
+fn schema_affected_package_dirs(
+    current_manifest: &QueryManifest,
+    previous_manifest: &QueryManifest,
+) -> anyhow::Result<SchemaAffectedPackages> {
+    let Some(previous_schema) = &previous_manifest.postgres_schema else {
+        return Ok(SchemaAffectedPackages::default());
+    };
+    let Some(current_schema) = &current_manifest.postgres_schema else {
+        return Ok(SchemaAffectedPackages::default());
+    };
+
+    let changed_objects = changed_postgres_objects(previous_schema, current_schema);
+    if changed_objects.is_empty() {
+        return Ok(SchemaAffectedPackages::default());
+    }
+
+    let packages = current_manifest
+        .packages
+        .iter()
+        .filter(|(_, package)| {
+            package
+                .dependencies
+                .iter()
+                .any(|dep| changed_objects.contains(dep))
+        })
+        .map(|(package_dir, _)| PathBuf::from(package_dir))
+        .collect();
+
+    Ok(SchemaAffectedPackages {
+        packages,
+        changed_objects,
+    })
+}
+
 fn print_verbose_selection(ctx: &PrepareCtx<'_>, selection: Option<&PackageSelection>) {
     println!("prepare verbose:");
     println!("  workspace: {}", ctx.workspace);
     println!("  detect-query-changes: {}", ctx.detect_query_changes);
+    println!("  detect-schema-changes: {}", ctx.detect_schema_changes);
 
     match selection {
-        None => println!("  path: full prepare"),
+        None => {
+            println!("  path: full prepare");
+        }
         Some(selection) => {
             println!("  path: selective prepare");
             println!("  packages selected: {}", selection.packages.len());
@@ -584,6 +679,23 @@ fn print_verbose_selection(ctx: &PrepareCtx<'_>, selection: Option<&PackageSelec
                 println!("  query text changes:");
                 for package in &selection.query_changed_packages {
                     println!("    {}", package.display());
+                }
+            }
+
+            if ctx.detect_schema_changes {
+                println!(
+                    "  schema objects changed: {}",
+                    selection.changed_schema_objects.len()
+                );
+                for object in &selection.changed_schema_objects {
+                    println!("    {}", object);
+                }
+
+                if !selection.schema_changed_packages.is_empty() {
+                    println!("  packages selected by schema changes:");
+                    for package in &selection.schema_changed_packages {
+                        println!("    {}", package.display());
+                    }
                 }
             }
 
@@ -596,6 +708,15 @@ fn print_verbose_selection(ctx: &PrepareCtx<'_>, selection: Option<&PackageSelec
                 }
             }
         }
+    }
+}
+
+fn unchanged_reason(ctx: &PrepareCtx<'_>) -> &'static str {
+    match (ctx.detect_query_changes, ctx.detect_schema_changes) {
+        (true, true) => "query and schema data unchanged",
+        (true, false) => "query data unchanged",
+        (false, true) => "schema data unchanged",
+        (false, false) => "query data unchanged",
     }
 }
 
@@ -623,7 +744,7 @@ fn load_query_manifest(path: &Path) -> anyhow::Result<QueryManifest> {
     }
 }
 
-fn build_query_manifest(ctx: &PrepareCtx<'_>) -> anyhow::Result<QueryManifest> {
+async fn build_query_manifest(ctx: &PrepareCtx<'_>) -> anyhow::Result<QueryManifest> {
     let mut packages = BTreeMap::new();
 
     if ctx.workspace {
@@ -636,7 +757,14 @@ fn build_query_manifest(ctx: &PrepareCtx<'_>) -> anyhow::Result<QueryManifest> {
         packages.insert(package_key(package), scan_package_queries(package)?);
     }
 
-    Ok(QueryManifest { packages })
+    Ok(QueryManifest {
+        packages,
+        postgres_schema: if ctx.detect_schema_changes {
+            fetch_postgres_schema_snapshot(ctx).await?
+        } else {
+            None
+        },
+    })
 }
 
 fn package_key(package: &Package) -> String {
@@ -664,6 +792,7 @@ fn sqlx_macro_workspace_packages(metadata: &Metadata) -> Vec<&Package> {
 
 fn scan_package_queries(package: &Package) -> anyhow::Result<PackageQueries> {
     let mut queries = BTreeSet::new();
+    let mut dependencies = BTreeSet::new();
 
     for rust_file in rust_files_in(package.manifest_dir())? {
         let source = fs::read_to_string(&rust_file)
@@ -676,11 +805,13 @@ fn scan_package_queries(package: &Package) -> anyhow::Result<PackageQueries> {
         visitor.visit_file(&syntax);
         for query in visitor.finish()? {
             queries.insert(hash_query_text(&query));
+            dependencies.extend(extract_sql_dependencies(&query));
         }
     }
 
     Ok(PackageQueries {
         queries: queries.into_iter().collect(),
+        dependencies: dependencies.into_iter().collect(),
     })
 }
 
@@ -700,6 +831,37 @@ fn touched_query_hashes(
         .filter(|(package_dir, _)| touched_packages.contains(&PathBuf::from(package_dir.as_str())))
         .flat_map(|(_, package)| package.queries.iter().cloned())
         .collect()
+}
+
+fn changed_postgres_objects(
+    previous_schema: &PostgresSchemaSnapshot,
+    current_schema: &PostgresSchemaSnapshot,
+) -> BTreeSet<String> {
+    let mut changed = BTreeSet::new();
+
+    for (name, signature) in &current_schema.objects {
+        if previous_schema.objects.get(name) != Some(signature) {
+            changed.extend(expand_postgres_object_aliases(name));
+        }
+    }
+
+    for name in previous_schema.objects.keys() {
+        if !current_schema.objects.contains_key(name) {
+            changed.extend(expand_postgres_object_aliases(name));
+        }
+    }
+
+    changed
+}
+
+fn expand_postgres_object_aliases(name: &str) -> BTreeSet<String> {
+    let mut aliases = BTreeSet::from([name.to_string()]);
+    if let Some((kind, qualified_name)) = name.split_once(':') {
+        if let Some((_, object_name)) = qualified_name.rsplit_once('.') {
+            aliases.insert(format!("{kind}:{object_name}"));
+        }
+    }
+    aliases
 }
 
 fn rust_files_in(dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
@@ -903,6 +1065,398 @@ impl Parse for QueryFileAsMacroArgs {
     }
 }
 
+async fn fetch_postgres_schema_snapshot(
+    ctx: &PrepareCtx<'_>,
+) -> anyhow::Result<Option<PostgresSchemaSnapshot>> {
+    let Some(database_url) = ctx.connect_opts.database_url.as_deref() else {
+        return Ok(None);
+    };
+
+    if !is_postgres_url(database_url) {
+        return Ok(None);
+    }
+
+    let mut conn = crate::connect(ctx.config, &ctx.connect_opts).await?;
+    let mut objects = BTreeMap::new();
+
+    let relation_rows = sqlx::query(
+        r#"
+SELECT
+    c.relkind::text AS relkind,
+    n.nspname::text AS schema_name,
+    c.relname::text AS object_name,
+    COALESCE(pg_get_viewdef(c.oid, true), '') AS definition,
+    COALESCE(
+        string_agg(
+            a.attname::text || ':' || pg_catalog.format_type(a.atttypid, a.atttypmod) || ':' || a.attnotnull::int,
+            ',' ORDER BY a.attnum
+        ) FILTER (WHERE a.attnum > 0 AND NOT a.attisdropped),
+        ''
+    ) AS columns
+FROM pg_class c
+JOIN pg_namespace n ON n.oid = c.relnamespace
+LEFT JOIN pg_attribute a ON a.attrelid = c.oid
+WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f')
+  AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+  AND n.nspname NOT LIKE 'pg_toast%'
+GROUP BY c.oid, c.relkind, n.nspname, c.relname
+        "#,
+    )
+    .fetch_all(&mut conn)
+    .await?;
+
+    for row in relation_rows {
+        let relkind: String = row.try_get("relkind")?;
+        let schema_name: String = row.try_get("schema_name")?;
+        let object_name: String = row.try_get("object_name")?;
+        let definition: String = row.try_get("definition")?;
+        let columns: String = row.try_get("columns")?;
+
+        objects.insert(
+            format!("relation:{schema_name}.{object_name}"),
+            format!("{relkind}|{columns}|{definition}"),
+        );
+    }
+
+    let function_rows = sqlx::query(
+        r#"
+SELECT
+    n.nspname::text AS schema_name,
+    p.proname::text AS object_name,
+    pg_get_function_identity_arguments(p.oid) AS identity_args,
+    pg_get_function_result(p.oid) AS result_type,
+    pg_get_functiondef(p.oid) AS definition
+FROM pg_proc p
+JOIN pg_namespace n ON n.oid = p.pronamespace
+WHERE n.nspname NOT IN ('pg_catalog', 'information_schema')
+  AND n.nspname NOT LIKE 'pg_toast%'
+        "#,
+    )
+    .fetch_all(&mut conn)
+    .await?;
+
+    for row in function_rows {
+        let schema_name: String = row.try_get("schema_name")?;
+        let object_name: String = row.try_get("object_name")?;
+        let identity_args: String = row.try_get("identity_args")?;
+        let result_type: String = row.try_get("result_type")?;
+        let definition: String = row.try_get("definition")?;
+
+        objects.insert(
+            format!("function:{schema_name}.{object_name}"),
+            format!("{identity_args}|{result_type}|{definition}"),
+        );
+    }
+
+    let type_rows = sqlx::query(
+        r#"
+SELECT
+    n.nspname::text AS schema_name,
+    t.typname::text AS object_name,
+    t.typtype::text AS type_kind,
+    COALESCE(string_agg(DISTINCT e.enumlabel::text, ',' ORDER BY e.enumlabel::text), '') AS enum_labels,
+    COALESCE(
+        string_agg(
+            DISTINCT a.attname::text || ':' || pg_catalog.format_type(a.atttypid, a.atttypmod),
+            ',' ORDER BY a.attname::text || ':' || pg_catalog.format_type(a.atttypid, a.atttypmod)
+        ) FILTER (WHERE a.attnum > 0 AND NOT a.attisdropped),
+        ''
+    ) AS attributes
+FROM pg_type t
+JOIN pg_namespace n ON n.oid = t.typnamespace
+LEFT JOIN pg_enum e ON e.enumtypid = t.oid
+LEFT JOIN pg_class c ON c.oid = t.typrelid
+LEFT JOIN pg_attribute a ON a.attrelid = c.oid
+WHERE n.nspname NOT IN ('pg_catalog', 'information_schema')
+  AND n.nspname NOT LIKE 'pg_toast%'
+  AND t.typtype IN ('e', 'c', 'd')
+GROUP BY t.oid, n.nspname, t.typname, t.typtype
+        "#,
+    )
+    .fetch_all(&mut conn)
+    .await?;
+
+    for row in type_rows {
+        let schema_name: String = row.try_get("schema_name")?;
+        let object_name: String = row.try_get("object_name")?;
+        let type_kind: String = row.try_get("type_kind")?;
+        let enum_labels: String = row.try_get("enum_labels")?;
+        let attributes: String = row.try_get("attributes")?;
+
+        objects.insert(
+            format!("type:{schema_name}.{object_name}"),
+            format!("{type_kind}|{enum_labels}|{attributes}"),
+        );
+    }
+
+    conn.close().await?;
+
+    Ok(Some(PostgresSchemaSnapshot { objects }))
+}
+
+fn is_postgres_url(database_url: &str) -> bool {
+    database_url.starts_with("postgres://") || database_url.starts_with("postgresql://")
+}
+
+fn extract_sql_dependencies(query: &str) -> BTreeSet<String> {
+    let tokens = sql_dependency_tokens(query);
+    let mut dependencies = BTreeSet::new();
+
+    let mut i = 0;
+    while i < tokens.len() {
+        let token = tokens[i].as_str();
+
+        if matches!(token, "from" | "join" | "update" | "into") {
+            if let Some((name, next)) = parse_object_name(&tokens, i + 1) {
+                dependencies.insert(format!("relation:{name}"));
+                i = next;
+                continue;
+            }
+        }
+
+        if token == "delete" && tokens.get(i + 1).is_some_and(|next| next == "from") {
+            if let Some((name, next)) = parse_object_name(&tokens, i + 2) {
+                dependencies.insert(format!("relation:{name}"));
+                i = next;
+                continue;
+            }
+        }
+
+        if token == "truncate" {
+            let offset = if tokens.get(i + 1).is_some_and(|next| next == "table") {
+                i + 2
+            } else {
+                i + 1
+            };
+            if let Some((name, next)) = parse_object_name(&tokens, offset) {
+                dependencies.insert(format!("relation:{name}"));
+                i = next;
+                continue;
+            }
+        }
+
+        if token == "::" {
+            if let Some((name, next)) = parse_object_name(&tokens, i + 1) {
+                dependencies.insert(format!("type:{name}"));
+                i = next;
+                continue;
+            }
+        }
+
+        if token == "as" {
+            if let Some((name, next)) = parse_type_name(&tokens, i + 1) {
+                dependencies.insert(format!("type:{name}"));
+                i = next;
+                continue;
+            }
+        }
+
+        if is_identifier(token)
+            && tokens.get(i + 1).is_some_and(|next| next == ".")
+            && tokens.get(i + 3).is_some_and(|next| next == "(")
+            && is_identifier(tokens[i + 2].as_str())
+        {
+            dependencies.insert(format!("function:{}.{}", token, tokens[i + 2]));
+            i += 4;
+            continue;
+        }
+
+        if is_identifier(token)
+            && tokens.get(i + 1).is_some_and(|next| next == "(")
+            && !FUNCTION_KEYWORDS.contains(&token)
+        {
+            dependencies.insert(format!("function:{token}"));
+            i += 2;
+            continue;
+        }
+
+        i += 1;
+    }
+
+    dependencies
+}
+
+const FUNCTION_KEYWORDS: &[&str] = &[
+    "array",
+    "cast",
+    "count",
+    "distinct",
+    "exists",
+    "extract",
+    "greatest",
+    "in",
+    "least",
+    "over",
+    "position",
+    "substring",
+    "trim",
+    "values",
+];
+
+fn sql_dependency_tokens(query: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut chars = query.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        match ch {
+            '-' if chars.peek() == Some(&'-') => {
+                chars.next();
+                for next in chars.by_ref() {
+                    if next == '\n' {
+                        break;
+                    }
+                }
+            }
+            '/' if chars.peek() == Some(&'*') => {
+                chars.next();
+                let mut prev = '\0';
+                for next in chars.by_ref() {
+                    if prev == '*' && next == '/' {
+                        break;
+                    }
+                    prev = next;
+                }
+            }
+            '\'' => skip_quoted(&mut chars, '\''),
+            '"' => {
+                let ident = read_quoted_identifier(&mut chars);
+                if !ident.is_empty() {
+                    tokens.push(ident.to_lowercase());
+                }
+            }
+            ':' if chars.peek() == Some(&':') => {
+                chars.next();
+                tokens.push("::".to_string());
+            }
+            '.' | '(' | ')' | ',' => tokens.push(ch.to_string()),
+            c if is_sql_ident_start(c) => {
+                let mut ident = String::from(c);
+                while let Some(next) = chars.peek().copied() {
+                    if is_sql_ident_continue(next) {
+                        ident.push(next);
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                tokens.push(ident.to_lowercase());
+            }
+            _ => {}
+        }
+    }
+
+    tokens
+}
+
+fn skip_quoted(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, quote: char) {
+    while let Some(ch) = chars.next() {
+        if ch == quote {
+            if chars.peek() == Some(&quote) {
+                chars.next();
+                continue;
+            }
+            break;
+        }
+    }
+}
+
+fn read_quoted_identifier(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> String {
+    let mut ident = String::new();
+    while let Some(ch) = chars.next() {
+        if ch == '"' {
+            if chars.peek() == Some(&'"') {
+                ident.push('"');
+                chars.next();
+                continue;
+            }
+            break;
+        }
+        ident.push(ch);
+    }
+    ident
+}
+
+fn parse_object_name(tokens: &[String], start: usize) -> Option<(String, usize)> {
+    let first = tokens.get(start)?;
+    if !is_identifier(first) {
+        return None;
+    }
+    if tokens.get(start + 1).is_some_and(|next| next == ".") {
+        let second = tokens.get(start + 2)?;
+        if is_identifier(second) {
+            return Some((format!("{first}.{second}"), start + 3));
+        }
+    }
+
+    Some((first.clone(), start + 1))
+}
+
+fn parse_type_name(tokens: &[String], start: usize) -> Option<(String, usize)> {
+    let (name, next) = parse_object_name(tokens, start)?;
+    if TYPE_KEYWORDS.contains(&name.as_str()) {
+        return None;
+    }
+    Some((name, next))
+}
+
+const TYPE_KEYWORDS: &[&str] = &[
+    "bigint",
+    "bigserial",
+    "bit",
+    "bool",
+    "boolean",
+    "box",
+    "bytea",
+    "char",
+    "character",
+    "cidr",
+    "circle",
+    "date",
+    "decimal",
+    "double",
+    "float",
+    "inet",
+    "int",
+    "int2",
+    "int4",
+    "int8",
+    "integer",
+    "interval",
+    "json",
+    "jsonb",
+    "line",
+    "lseg",
+    "macaddr",
+    "money",
+    "numeric",
+    "path",
+    "point",
+    "polygon",
+    "real",
+    "serial",
+    "smallint",
+    "text",
+    "time",
+    "timestamp",
+    "timestamptz",
+    "timetz",
+    "uuid",
+    "varchar",
+    "void",
+];
+
+fn is_identifier(token: &str) -> bool {
+    !token.is_empty() && token.chars().all(is_sql_ident_continue)
+}
+
+fn is_sql_ident_start(ch: char) -> bool {
+    ch == '_' || ch.is_ascii_alphabetic()
+}
+
+fn is_sql_ident_continue(ch: char) -> bool {
+    is_sql_ident_start(ch) || ch.is_ascii_digit() || ch == '$'
+}
+
 /// Find all `query-*.json` files in a directory.
 fn glob_query_files(path: impl AsRef<Path>) -> anyhow::Result<Vec<PathBuf>> {
     let path = path.as_ref();
@@ -977,5 +1531,32 @@ mod tests {
             Some("select 1".to_string())
         );
         Ok(())
+    }
+
+    #[test]
+    fn extract_sql_dependencies_finds_relations_functions_and_types() {
+        let deps = extract_sql_dependencies(
+            "select lower(u.email)::citext from public.users u join orgs o on o.id = u.org_id where exists(select 1 from audit_log)",
+        );
+
+        assert!(deps.contains("relation:public.users"));
+        assert!(deps.contains("relation:orgs"));
+        assert!(deps.contains("relation:audit_log"));
+        assert!(deps.contains("function:lower"));
+        assert!(deps.contains("type:citext"));
+    }
+
+    #[test]
+    fn changed_postgres_objects_matches_unqualified_dependencies() {
+        let previous = PostgresSchemaSnapshot {
+            objects: BTreeMap::from([("relation:public.users".to_string(), "old".to_string())]),
+        };
+        let current = PostgresSchemaSnapshot {
+            objects: BTreeMap::from([("relation:public.users".to_string(), "new".to_string())]),
+        };
+
+        let changed = changed_postgres_objects(&previous, &current);
+        assert!(changed.contains("relation:public.users"));
+        assert!(changed.contains("relation:users"));
     }
 }
