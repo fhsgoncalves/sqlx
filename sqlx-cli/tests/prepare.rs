@@ -96,5 +96,5 @@ async fn prepare_verbose_reports_selective_path() {
     assert!(stdout.contains("detect-schema-changes: true"));
     assert!(stdout.contains("packages selected: 0"));
     assert!(stdout.contains("no packages selected"));
-    assert!(stdout.contains("query data unchanged; skipping recompilation"));
+    assert!(stdout.contains("schema data unchanged; skipping recompilation"));
 }

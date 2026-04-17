@@ -116,7 +116,7 @@ async fn prepare(ctx: &PrepareCtx<'_>) -> anyhow::Result<()> {
 
     if selection.as_ref().is_some_and(|selection| selection.packages.is_empty()) {
         save_query_manifest(ctx, &current_manifest)?;
-        println!("query data unchanged; skipping recompilation");
+        println!("{}; skipping recompilation", unchanged_reason(ctx));
         return Ok(());
     }
 
@@ -531,19 +531,39 @@ fn select_changed_packages(
     previous_manifest: &QueryManifest,
 ) -> anyhow::Result<PackageSelection> {
     if previous_manifest.packages.is_empty() {
-        let packages: BTreeSet<_> = current_manifest
-            .packages
-            .keys()
-            .map(PathBuf::from)
-            .collect();
+        let query_changed_packages = if ctx.detect_query_changes {
+            current_manifest
+                .packages
+                .keys()
+                .map(PathBuf::from)
+                .collect()
+        } else {
+            BTreeSet::new()
+        };
+        let schema_changed_packages = if ctx.detect_schema_changes {
+            current_manifest
+                .packages
+                .keys()
+                .map(PathBuf::from)
+                .collect()
+        } else {
+            BTreeSet::new()
+        };
+        let mut packages = query_changed_packages.clone();
+        packages.extend(schema_changed_packages.iter().cloned());
         return Ok(PackageSelection {
-            query_changed_packages: packages.clone(),
+            query_changed_packages,
+            schema_changed_packages,
             packages,
             ..Default::default()
         });
     }
 
-    let query_changed_packages = query_changed_package_dirs(current_manifest, previous_manifest);
+    let query_changed_packages = if ctx.detect_query_changes {
+        query_changed_package_dirs(current_manifest, previous_manifest)
+    } else {
+        BTreeSet::new()
+    };
     let mut packages = query_changed_packages.clone();
     let mut schema_changed_packages = BTreeSet::new();
     let mut changed_schema_objects = BTreeSet::new();
@@ -672,6 +692,15 @@ fn print_verbose_selection(ctx: &PrepareCtx<'_>, selection: Option<&PackageSelec
                 }
             }
         }
+    }
+}
+
+fn unchanged_reason(ctx: &PrepareCtx<'_>) -> &'static str {
+    match (ctx.detect_query_changes, ctx.detect_schema_changes) {
+        (true, true) => "query and schema data unchanged",
+        (true, false) => "query data unchanged",
+        (false, true) => "schema data unchanged",
+        (false, false) => "query data unchanged",
     }
 }
 
